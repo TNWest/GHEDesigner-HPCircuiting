@@ -8,7 +8,6 @@ import pandas as pd
 from xlsxwriter.utility import xl_rowcol_to_cell
 from scipy.sparse import csgraph
 from scipy.sparse import csr_matrix
-import scipy
 
 # from ghedt.RowWise.Shape import Shapes # needed for future updates
 
@@ -118,7 +117,7 @@ class PipeNetwork:
         worksheet_1 = writer.sheets[sheet_1_name]
         s1_chart_1 = workbook.add_chart({'type': 'scatter'})
         for vault in range(self.number_of_vaults):
-            list_of_rows = np.where(self.vault_clusters == vault)[0] + 1
+            list_of_rows = np.where(self.vault_clusters == vault)[0] + 4
             col_x = sheet_1_frame.columns.get_loc('b_x') + 1
             col_y = sheet_1_frame.columns.get_loc('b_y') + 1
             category_references = self.build_excell_reference_string(list_of_rows,
@@ -491,6 +490,7 @@ class PipeNetwork:
             # Get Distance Between Each Datapoint and The Cluster Means
             # dist = self.distance_subset_sums(coord_inds, borehole_clusters, num_of_clusters)
             dist, paths = self.path_calculation(coords, c_means)
+
             # Sort Data Based on the Difference Between the Distance of Their Current Assignment vs. Their Optimal One
             i = 0
             for dist_row in dist:

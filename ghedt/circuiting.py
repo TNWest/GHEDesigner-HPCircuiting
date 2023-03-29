@@ -2,12 +2,16 @@ from os.path import isfile
 from math import ceil
 from math import sqrt
 from math import floor
+from math import sqrt
 
 import numpy as np
 import pandas as pd
+import ghedt.search_routines as srs
 from xlsxwriter.utility import xl_rowcol_to_cell
 from scipy.sparse import csgraph
 from scipy.sparse import csr_matrix
+from ghedt.RowWise.Shape import Shapes
+import pandapipes as pp
 
 # from ghedt.RowWise.Shape import Shapes # needed for future updates
 
@@ -23,10 +27,21 @@ class PipeNetwork:
         self.pipe_size_data = pd.read_csv(self.pipe_size_data_filename)
         self.cost_data = pd.read_csv(self.cost_data_filename)
 
+        # Convert the given property boundary and nogo zones into Shape objects
+        self.property_boundary_shape = Shapes(self.property_boundary)
+        nogo_zone_array = []
+        for nogo_zone_coord in self.nogo_zone_coords:
+            nogo_zone_array.append(Shapes(nogo_zone_coord))
+        self.nogo_zones = nogo_zone_array
+
+        self.trenches = {}
+
+        # Create a pipe routing grid of points
+        self.create_pipe_routing_grid()
+
         # Determine existing paths and distances
         self.borehole_connection_distances, self.borehole_connection_paths = \
-                                            self.path_calculation(self.coords, self.coords)
-
+            self.path_calculation(self.coords, self.coords)
 
     def assign_and_validate_arguments(self, kwargs: dict):
 
@@ -37,6 +52,11 @@ class PipeNetwork:
         assert "root_location" in kwargs
         assert "cost_data_filename" in kwargs
         assert "pipe_size_data_filename" in kwargs
+        # assert "ghe" in kwargs
+        assert "max_ghe_pressure_drop" in kwargs
+        assert "property_boundary" in kwargs
+        assert "nogo_zones" in kwargs
+
 
         # Check that all inputs are the correct datatype, and assign them to a property.
 
@@ -54,6 +74,22 @@ class PipeNetwork:
         assert all(isinstance(val, float) for val in kwargs["root_location"])
         self.root_location = kwargs["root_location"]
 
+        assert isinstance(kwargs["property_boundary"], list)
+        assert all(isinstance(val, list) for val in kwargs["property_boundary"])
+        assert all(isinstance(val, float) for point in kwargs["property_boundary"] for val in point)
+        self.property_boundary = kwargs["property_boundary"]
+
+        if "nogo_zones" in kwargs:
+            assert isinstance(kwargs["nogo_zones"], list)
+            assert all(isinstance(val, list) for val in kwargs["nogo_zones"])
+            assert all(isinstance(val_2, list) for val in kwargs["nogo_zones"]
+                       for val_2 in val)
+            assert all(isinstance(val_3, float) for val in kwargs["nogo_zones"]
+                       for val_2 in val for val_3 in val_2)
+            self.nogo_zone_coords = kwargs["nogo_zones"]
+        else:
+            self.nogo_zone_coords = []
+
         if "max_iter" in kwargs:
             assert isinstance(kwargs["max_iter"], int)
             self.max_iter = kwargs["max_iter"]
@@ -66,6 +102,12 @@ class PipeNetwork:
         else:
             self.clustering_seed = None
 
+        if "routing_grid_fidelity" in kwargs:
+            assert isinstance(kwargs["routing_grid_fidelity"], float)
+            self.routing_grid_fidelity = kwargs["routing_grid_fidelity"]
+        else:
+            self.routing_grid_fidelity = 1.0 # in m
+
         assert isinstance(kwargs["cost_data_filename"], str)
         assert isfile(kwargs["cost_data_filename"])
         self.cost_data_filename = kwargs["cost_data_filename"]
@@ -74,7 +116,103 @@ class PipeNetwork:
         assert isfile(kwargs["pipe_size_data_filename"])
         self.pipe_size_data_filename = kwargs["pipe_size_data_filename"]
 
-    def build_excell_reference_string(self,
+        #assert isinstance(kwargs["ghe"], srs.Bisection1D) or \
+               #isinstance(kwargs["ghe"], srs.RowWiseModifiedBisectionSearch)
+        #self.ghe = kwargs["ghe"]
+
+        assert isinstance(kwargs["max_ghe_pressure_drop"], float) # in ft
+        self.max_ghe_pressure_drop = kwargs["max_ghe_pressure_drop"]
+
+        if "return_type" in kwargs:
+            self.return_type = kwargs["return_type"]
+        else:
+            self.return_type = "direct"
+
+    def create_pipe_routing_grid(self):
+
+        # Create Inital grid
+        x_min = self.property_boundary_shape.minx
+        x_max = self.property_boundary_shape.maxx
+        y_min = self.property_boundary_shape.miny
+        y_max = self.property_boundary_shape.maxy
+
+        minimum_step_size = self.routing_grid_fidelity
+
+        number_of_x_points = int((x_max - x_min) / minimum_step_size)
+        number_of_y_points = int((y_max - y_min) / minimum_step_size)
+
+        x_vals = np.linspace(x_min, x_max, num=number_of_x_points, dtype=np.double)
+        y_vals = np.linspace(y_min, y_max, num=number_of_y_points, dtype=np.double)
+
+        number_of_points_in_grid = number_of_y_points * number_of_x_points
+        x_step = x_vals[1] - x_vals[0]
+        y_step = y_vals[1] - y_vals[0]
+
+        # Create array of point locations
+        pipe_routing_grid_coords = []
+        for x_val in x_vals:
+            for y_val in y_vals:
+                pipe_routing_grid_coords.append([x_val, y_val])
+
+        # Determine which points need to be trimmed from the grid
+        for i in range(number_of_points_in_grid - 1, -1, -1):
+            current_coord = pipe_routing_grid_coords[i]
+            should_point_be_trimmed = False
+            if not self.property_boundary_shape.pointintersect(current_coord):
+                should_point_be_trimmed = True
+            if not should_point_be_trimmed:
+                for nogo_zone in self.nogo_zones:
+                    if nogo_zone.pointintersect(current_coord):
+                        should_point_be_trimmed = True
+            if should_point_be_trimmed:
+                pipe_routing_grid_coords.pop(i)
+        number_of_points_in_grid = len(pipe_routing_grid_coords)
+        self.pipe_routing_grid_points = pipe_routing_grid_coords
+
+        # Form dense connection tree based on the distances between each point (ensuring not to include connections
+        # that intersect the property boundary or one of the nogo zones).
+        dense_grid_network = []
+        for i in range(number_of_points_in_grid):
+            current_row_of_connections = []
+            for j in range(number_of_points_in_grid):
+                # if j == 389:
+                    # print("here")
+                if i == j:
+                    current_row_of_connections.append(0.0)
+                    continue
+                point_1 = pipe_routing_grid_coords[i]
+                point_2 = pipe_routing_grid_coords[j]
+                distance = self.euler_distance(point_1,
+                                               point_2)
+                should_connection_be_included = True
+                property_intersections = self.property_boundary_shape \
+                    .lineintersect([point_1[0], point_1[1],
+                                    point_2[0], point_2[1]])
+                if len(property_intersections) > 0:
+                    should_connection_be_included = False
+                if should_connection_be_included:
+                    for nogo_zone in self.nogo_zones:
+                        nogo_intersections = nogo_zone.lineintersect([point_1[0],
+                                                        point_1[1], point_2[0], point_2[1]])
+                        if len(nogo_intersections) > 0:
+                            should_connection_be_included = False
+                if should_connection_be_included:
+                    current_row_of_connections.append(distance)
+                else:
+                    current_row_of_connections.append(0)
+            dense_grid_network.append(current_row_of_connections)
+        self.pipe_routing_grid_connections = np.array(dense_grid_network, dtype=np.float)
+
+        # Determine the shortest paths between each node in the network.
+        self.pipe_routing_grid_distances, self.pipe_routing_grid_path_predecessors = \
+            csgraph.shortest_path(self.pipe_routing_grid_connections, directed=False, return_predecessors=True)
+
+        # Create dictionary to record which routing points where actually used (for pipe sizing purposes).
+        self.pipe_routing_grid_points_used = {}
+        for grid_point in range(len(self.pipe_routing_grid_points)):
+            self.pipe_routing_grid_points_used[grid_point] = False
+
+    def build_excel_reference_string(self,
                             row_indices: np.array, column_indices: np.array, sheet_name: str):
         reference_string_array = ["("]
         number_of_references = len(row_indices)
@@ -120,9 +258,9 @@ class PipeNetwork:
             list_of_rows = np.where(self.vault_clusters == vault)[0] + 4
             col_x = sheet_1_frame.columns.get_loc('b_x') + 1
             col_y = sheet_1_frame.columns.get_loc('b_y') + 1
-            category_references = self.build_excell_reference_string(list_of_rows,
+            category_references = self.build_excel_reference_string(list_of_rows,
                                             col_x * np.ones(len(list_of_rows), dtype=np.int64), sheet_1_name)
-            value_references = self.build_excell_reference_string(list_of_rows,
+            value_references = self.build_excel_reference_string(list_of_rows,
                                             col_y * np.ones(len(list_of_rows), dtype=np.int64), sheet_1_name)
             s1_chart_1.add_series({
                 'name': "".join(["Vault: ", str(vault)]),
@@ -140,7 +278,7 @@ class PipeNetwork:
         s1_chart_1.set_legend({'position': 'bottom'})
         worksheet_1.insert_chart(3, 8, s1_chart_1)
 
-        # The following sheets contain circuit assignments and the circuit topology
+        # The following sheets 1.# contain circuit assignments and the circuit topology
         for vault_number in range(self.number_of_vaults):
             sheet_list = []
             vault_circuit_inds = np.append([-1, -1], self.circuit_clusters[vault_number], axis=0)
@@ -162,25 +300,266 @@ class PipeNetwork:
                 sheet_list_row.extend(self.circuit_topologies[vault_number][coord_number])
                 sheet_list.append(sheet_list_row)
             sheet_frame = pd.DataFrame(sheet_list, columns=column_list)
-            sheet_frame.to_excel(writer, sheet_name="Vault_{}_CrctAsnmnts_a_Tplgy".format(vault_number))
+            sheet_name = "Vault_{}_CrctAsnmnts_a_Tplgy".format(vault_number)
+            sheet_frame.to_excel(writer, sheet_name=sheet_name)
+
+            # Creating Plot for sheet 1.#
+            worksheet = writer.sheets[sheet_name]
+            s_chart_1 = workbook.add_chart({'type': 'scatter'})
+            max_circuit_label = np.max(vault_circuit_inds)
+            for circuit_number in range(max_circuit_label):
+                list_of_rows = np.where(vault_circuit_inds == circuit_number)[0] + 1
+                col_x = sheet_frame.columns.get_loc('b_x') + 1
+                col_y = sheet_frame.columns.get_loc('b_y') + 1
+                category_references = self.build_excel_reference_string(list_of_rows,
+                                                    col_x * np.ones(len(list_of_rows),
+                                                    dtype=np.int64), sheet_name)
+                value_references = self.build_excel_reference_string(list_of_rows,
+                                                    col_y * np.ones(len(list_of_rows),
+                                                    dtype=np.int64), sheet_name)
+                s_chart_1.add_series({
+                    'name': "".join(["Circuit: ", str(circuit_number)]),
+                    'categories': category_references,
+                    'values': value_references,
+                    'marker': {'type': 'automatic', 'size': 3},
+                })
+            s_chart_1.set_x_axis({'name': 'x (m)', 'max': x_max, 'min': x_min})
+            s_chart_1.set_y_axis({'name': 'y (m)', 'max': y_max, 'min': y_min})
+            s_chart_1.set_plotarea({
+                'x': desired_figure_width,
+                'y': desired_figure_width * yx_ratio
+            })
+            # s1_chart_1.set_size({'width': 1080, 'width': 810})
+            s_chart_1.set_legend({'position': 'bottom'})
+            worksheet.insert_chart(3, 8, s_chart_1)
+
+        # Sheet 3 contains the pipe routing grid
+        sheet_3_list = []
+        sheet_3_name = "Pipe_Routing_Grid"
+        column_list = ["Point x","Point y"]
+        number_of_points = len(self.pipe_routing_grid_points)
+        for grid_point in self.pipe_routing_grid_points:
+            sheet_3_list_row = [grid_point[0], grid_point[1]]
+            sheet_3_list.append(sheet_3_list_row)
+        sheet_3_frame = pd.DataFrame(sheet_3_list, columns=column_list)
+        sheet_3_frame.to_excel(writer, sheet_name=sheet_3_name)
+
+        # Creating Plot for sheet 3
+        worksheet_3 = writer.sheets[sheet_3_name]
+        s3_chart_1 = workbook.add_chart({'type': 'scatter'})
+        col_x = sheet_3_frame.columns.get_loc('Point x') + 1
+        category_references = "".join([sheet_3_name, "!", xl_rowcol_to_cell(1, col_x),
+                                       ":", xl_rowcol_to_cell(number_of_points, col_x)])
+        value_references = "".join([sheet_3_name, "!", xl_rowcol_to_cell(1, col_x + 1),
+                                       ":", xl_rowcol_to_cell(number_of_points, col_x + 1)])
+        s3_chart_1.add_series({
+            'name': "".join(["Grid Points"]),
+            'categories': category_references,
+            'values': value_references,
+            'marker': {'type': 'automatic', 'size': 3},
+        })
+        s3_chart_1.set_x_axis({'name': 'x (m)', 'max': x_max, 'min': x_min})
+        s3_chart_1.set_y_axis({'name': 'y (m)', 'max': y_max, 'min': y_min})
+        s3_chart_1.set_plotarea({
+            'x': desired_figure_width,
+            'y': desired_figure_width * yx_ratio
+        })
+        # s1_chart_1.set_size({'width': 1080, 'width': 810})
+        s3_chart_1.set_legend({'none': True})
+        worksheet_3.insert_chart(3, 10, s3_chart_1)
+
+
+
 
         # Sheet 2 contains the trenching information
         sheet_2_list = []
-        column_list = ["Trench Length","Point 1 Type", "Point 2 Type", "Point 1 x", "Point 1 y",
+        sheet_2_name = "Trench_Network"
+        column_list = ["Trench Length", "Point 1 Type", "Point 2 Type", "Point 1 Index", "Point 2 Index",
+                       "Point 1 x", "Point 1 y",
                        "Point 2 x", "Point 2 y"]
-        number_of_trenches = len(self.trench_lengths)
-        for trench in range(number_of_trenches):
-            sheet_2_list.append([self.trench_lengths[trench], self.trench_point_types[trench][0],
-                                 self.trench_point_types[trench][1]])
-            # Get point locations
-            sheet_2_list[trench].extend(self.get_point(self.trench_point_types[trench][0],
-                                        self.trench_point_indices[trench][0]))
-            sheet_2_list[trench].extend(self.get_point(self.trench_point_types[trench][1],
-                                        self.trench_point_indices[trench][1]))
+        number_of_trenches = len(self.trenches)
+        trench_dict = self.trenches
+        for trench in trench_dict:
+            local_trench_dict = trench_dict[trench]
+            sheet_2_list_row = [local_trench_dict["length"],
+                                local_trench_dict["connection_types"][0],
+                                local_trench_dict["connection_types"][1],
+                                local_trench_dict["connection_indices"][0],
+                                local_trench_dict["connection_indices"][1],
+                                local_trench_dict["connection_locations"][0][0],
+                                local_trench_dict["connection_locations"][0][1],
+                                local_trench_dict["connection_locations"][1][0],
+                                local_trench_dict["connection_locations"][1][1]]
+            sheet_2_list.append(sheet_2_list_row)
         sheet_2_frame = pd.DataFrame(sheet_2_list, columns=column_list)
-        sheet_2_frame.to_excel(writer, sheet_name="Trench_Network")
-        writer.close()
+        sheet_2_frame.to_excel(writer, sheet_name=sheet_2_name)
 
+        '''# Creating Plot for sheet 2
+        worksheet_2 = writer.sheets[sheet_2_name]
+        s2_chart_1 = workbook.add_chart({'type': 'scatter', 'subtype': 'straight'})
+        for trench_number in range(len(trench_dict)):
+            col_x = sheet_2_frame.columns.get_loc('Point 1 x') + 1
+            row_list = np.array([trench_number + 1, trench_number + 1], dtype=np.int64)
+            column_x_list = np.array([col_x, col_x + 2], dtype=np.int64)
+            column_y_list = np.array([col_x + 1, col_x + 3], dtype=np.int64)
+
+            category_references = self.build_excel_reference_string(row_list,
+                                                                    column_x_list,
+                                                                    sheet_2_name)
+            value_references = self.build_excel_reference_string(row_list,
+                                                                 column_y_list,
+                                                                 sheet_2_name)
+            s2_chart_1.add_series({
+                'name': "".join(["Trench: ", str(trench_number)]),
+                'categories': category_references,
+                'values': value_references,
+                # 'marker': {'type': 'automatic', 'size': 3},
+            })
+        s2_chart_1.set_x_axis({'name': 'x (m)', 'max': x_max, 'min': x_min})
+        s2_chart_1.set_y_axis({'name': 'y (m)', 'max': y_max, 'min': y_min})
+        s2_chart_1.set_plotarea({
+            'x': desired_figure_width,
+            'y': desired_figure_width * yx_ratio
+        })
+        # s1_chart_1.set_size({'width': 1080, 'width': 810})
+        s2_chart_1.set_legend({'none': True})
+        worksheet_2.insert_chart(3, 10, s2_chart_1)'''
+
+        # Sheet 2b contains the trench plot.
+        sheet_2b_list = []
+        sheet_2b_name = "Trench_Network_Plot"
+        column_list = ["Borehole x values", "Borehole y values", "Trench Point x values", "Trench Point y values"]
+
+        # Add the borehole locations
+        for borehole_location in self.coords:
+            sheet_2b_list.append([(borehole_location[0]), (borehole_location[1])])
+
+        # Add the trench point locations with blank lines between each trench
+        sheet_2b_list_current_index = 0
+        for trench_key in trench_dict:
+            trench = trench_dict[trench_key]
+            if len(sheet_2b_list) > sheet_2b_list_current_index:
+                sheet_2b_list[sheet_2b_list_current_index].extend([
+                    (trench["connection_locations"][0][0]),
+                    (trench["connection_locations"][0][1])
+                ])
+                sheet_2b_list_current_index += 1
+            else:
+                sheet_2b_list.append([
+                    "",
+                    "",
+                    (trench["connection_locations"][0][0]),
+                    (trench["connection_locations"][0][1])
+                ])
+                sheet_2b_list_current_index += 1
+            if len(sheet_2b_list) > sheet_2b_list_current_index:
+                sheet_2b_list[sheet_2b_list_current_index].extend([
+                    (trench["connection_locations"][1][0]),
+                    (trench["connection_locations"][1][1])
+                ])
+                sheet_2b_list_current_index += 1
+            else:
+                sheet_2b_list.append([
+                    "",
+                    "",
+                    (trench["connection_locations"][1][0]),
+                    (trench["connection_locations"][1][1])
+                ])
+                sheet_2b_list_current_index += 1
+            if len(sheet_2b_list) > sheet_2b_list_current_index:
+                sheet_2b_list[sheet_2b_list_current_index].extend([
+                    "",
+                    ""
+                ])
+                sheet_2b_list_current_index += 1
+            else:
+                sheet_2b_list.append([
+                    "",
+                    "",
+                    "",
+                    ""
+                ])
+                sheet_2b_list_current_index += 1
+        sheet_2b_frame = pd.DataFrame(sheet_2b_list, columns=column_list)
+        sheet_2b_frame.to_excel(writer, sheet_name=sheet_2b_name)
+
+        # Creating Plot for sheet 2b
+        worksheet_2b = writer.sheets[sheet_2b_name]
+        s2b_chart_1 = workbook.add_chart({'type': 'scatter', 'subtype': 'straight'})
+
+        # The first series represents the trenches.
+        col_x = sheet_2b_frame.columns.get_loc('Trench Point x values') + 1
+        # row_list = np.arange(1, len(sheet_2b_list), dtype=np.int64)
+        # column_x_list = np.ones(len(row_list), dtype=np.int64) * col_x
+        # column_y_list = np.ones(len(row_list), dtype=np.int64) * (col_x + 1)
+
+        category_references = ''.join([sheet_2b_name, '!$D2:$D$', str(len(sheet_2b_list))])
+        value_references = ''.join([sheet_2b_name, '!$E2:$E$', str(len(sheet_2b_list))])
+        s2b_chart_1.add_series({
+            'name': "".join("Trenches"),
+            'categories': category_references,
+            'values': value_references,
+            'line': {
+                'color': 'black',
+                'width': 1
+            }
+            # 'marker': {'type': 'automatic', 'size': 3},
+        })
+
+        # Add Second Series for borehole locations
+        col_x = sheet_2b_frame.columns.get_loc('Borehole x values') + 1
+        row_list = np.arange(1, len(self.coords), dtype=np.int64)
+        column_x_list = np.ones(len(row_list), dtype=np.int64) * col_x
+        column_y_list = np.ones(len(row_list), dtype=np.int64) * (col_x + 1)
+
+        category_references = ''.join([sheet_2b_name, '!$B2:$B$', str(len(sheet_2b_list))])
+        value_references = ''.join([sheet_2b_name, '!$C2:$C$', str(len(sheet_2b_list))])
+
+        s2b_chart_1.add_series({
+            'name': "".join("Boreholes"),
+            'categories': category_references,
+            'values': value_references,
+            'marker': {
+                'type': 'circle',
+                'size': 3,
+                'border': {'color': 'blue'},
+                'fill': {'color': 'blue'}
+            },
+            'line': {'none': True}
+        })
+
+
+        # Finish Chart Creation
+        s2b_chart_1.set_x_axis({'name': 'x (m)', 'max': x_max, 'min': x_min})
+        s2b_chart_1.set_y_axis({'name': 'y (m)', 'max': y_max, 'min': y_min})
+        s2b_chart_1.set_plotarea({
+            'x': desired_figure_width,
+            'y': desired_figure_width * yx_ratio
+        })
+        # s1_chart_1.set_size({'width': 1080, 'width': 810})
+        s2b_chart_1.set_legend({'none': True})
+        worksheet_2b.insert_chart(3, 10, s2b_chart_1)
+
+
+
+        # Sheet 4 contains the pipe junction information
+        sheet_4_name = "Pipe_Junction_Info"
+        sheet_4_frame = self.net.res_junction
+        sheet_4_frame.to_excel(writer, sheet_name=sheet_4_name)
+
+        # Sheet 5 contains the pipe flow information
+        sheet_5_name = "Pipe_Flow_Info"
+        sheet_5_frame = self.net.res_pipe
+        sheet_5_frame.to_excel(writer, sheet_name=sheet_5_name)
+
+        # Sheet 6 contains the pipe size information
+        sheet_6_name = "Pipe_Size_Info"
+        sheet_6_frame = self.net.pipe
+        sheet_6_frame.to_excel(writer, sheet_name=sheet_6_name)
+
+
+
+        writer.close()
 
     def get_point(self, point_type, point_index):
         if point_type == 1:
@@ -188,12 +567,11 @@ class PipeNetwork:
         elif point_type == 2:
             return self.vault_cluster_centroids[point_index]
         elif point_type == 3:
-            pass # pass-through points not implemented as of yet
+            return self.pipe_routing_grid_points[point_index]
         elif point_type == 4:
             return self.coords[point_index]
         else:
             raise ValueError('Point Type {} is not implemented.'.format(point_type))
-        return point
 
 
     def define_pipe_network_topology(self):
@@ -289,17 +667,35 @@ class PipeNetwork:
 
     def minimum_spanning_tree(self, coord_inds):
         # Getting Distance Between Each Point and Every Other Point
-        dist = self.borehole_connection_distances[coord_inds][:, coord_inds]
+        dist, path_predecessors = self.path_calculation(
+            self.coords[coord_inds], self.coords[coord_inds])
 
-        # Making Dense Graph
-        dense_graph = dist
-
-        sparse_graph = csr_matrix(dense_graph)
+        sparse_graph = csr_matrix(dist)
 
         MST = csgraph.minimum_spanning_tree(sparse_graph, overwrite=True)
         MST_dense = csgraph.csgraph_to_dense(MST)
 
-        return MST_dense
+        return MST_dense, path_predecessors
+
+    def add_trench(self, point_1_type, point_1_ind,
+                   point_2_type, point_2_ind):
+
+        trench_key = "{}_{}_{}_{}".format(point_1_type, point_1_ind,
+                                          point_2_type, point_2_ind)
+        if trench_key in self.trenches:
+            return 1
+
+        trench_length = self.euler_distance(self.get_point(point_1_type, point_1_ind),
+                                              self.get_point(point_2_type, point_2_ind))
+        self.trenches[trench_key] = {
+            "length" : trench_length,
+            "connection_types" : (point_1_type, point_2_type),
+            "connection_indices" : (point_1_ind, point_2_ind),
+            "connection_locations" : (self.get_point(point_1_type, point_1_ind),
+                                              self.get_point(point_2_type, point_2_ind))
+        }
+        return 0
+
 
 
     def define_trench_network(self):
@@ -311,9 +707,9 @@ class PipeNetwork:
         # 4th Value: index to find point 2 in its respective list.
 
         # Trench Connection Storage
-        trench_point_types = []
-        trench_point_indices = []
-        trench_lengths = []
+        # trench_point_types = []
+        # trench_point_indices = []
+        # trench_lengths = []
         circuit_trenches = []
         vault_circuit_connection = []
 
@@ -327,10 +723,14 @@ class PipeNetwork:
             vault_location = self.vault_cluster_centroids[vault_number]
 
             # Place trench between root and current vault
-            trench_point_types.append((1,2))
-            trench_point_indices.append((0, vault_number))
             dist, path = self.path_calculation([self.root_location], [vault_location])
-            trench_lengths.append(dist[0][0])
+            self.add_trench(1, 0, 3, path[0][0][0])
+            if len(path[0][0]) > 1:
+                for i in range(len(path[0][0]) - 1):
+                    self.add_trench(3, path[0][0][i], 3,
+                                    path[0][0][i + 1])
+            self.add_trench(3, path[0][0][-1], 2,
+                            vault_number)
             circuit_trenches.append([])
             vault_circuit_connection.append([])
 
@@ -341,47 +741,43 @@ class PipeNetwork:
                 circuit_coords = vault_coords[circuit_inds]
 
                 # Place a trench between the current vault and the closest borehole of the current circuit
-                dist, connection_paths = self.path_calculation(circuit_coords, [vault_location])
+                dist, path = self.path_calculation(circuit_coords, [vault_location])
                 closest_borehole = np.where(dist == dist.min())[0][0]
                 vault_node_connection = vault_indices[circuit_inds[closest_borehole]]
+                self.add_trench(4, vault_node_connection, 3, path[closest_borehole][0][0])
+                if len(path[closest_borehole][0]) > 1:
+                    for i in range(len(path[closest_borehole][0]) - 1):
+                        self.add_trench(3, path[closest_borehole][0][i], 3,
+                                        path[closest_borehole][0][i + 1])
+                self.add_trench(3, path[closest_borehole][0][-1], 2, vault_number)
                 vault_circuit_connection[vault_number].append(vault_node_connection)
-                trench_point_types.append((2,4))
-                trench_point_indices.append((vault_number, vault_node_connection))
-                trench_lengths.append(dist[0][0])
 
                 # Place trenches to form the minimum spanning tree of the current circuit
-                circuit_trench_network = self.minimum_spanning_tree(circuit_inds) # returns 2d numpy array
+                circuit_trench_network, path = self.minimum_spanning_tree(vault_indices[circuit_inds])
                 circuit_trenches[vault_number].append(circuit_trench_network)
                 number_of_points = len(circuit_trench_network) # square array
                 for p1 in range(number_of_points):
                     for p2 in range(number_of_points):
-                        #if p2 <= p1: # All connections are shown above the diagonal
-                            #continue
-                        #else:
                         connection = circuit_trench_network[p1][p2]
                         if connection != 0: # A valid connection will have a non-zero distance
-                            trench_point_types.append((4, 4)) # Currently all boreholes are directly connected
-                            trench_point_indices.append((circuit_inds[p1], circuit_inds[p2]))
-                            trench_lengths.append(connection)
-                        else:
-                            continue
+                            self.add_trench(4, vault_indices[circuit_inds[p1]], 3, path[p1][p2][0])
+                            if len(path[p1][p2]) > 1:
+                                for i in range(len(path[p1][p2]) - 1):
+                                    self.add_trench(3, path[p1][p2][i], 3,
+                                                    path[p1][p2][i + 1])
+                            self.add_trench(3, path[p1][p2][-1], 4, vault_indices[circuit_inds[p2]])
 
 
         # Convert lists to numpy arrays and store them
-        self.trench_point_types = np.array(trench_point_types, dtype=np.int32)
-        self.trench_point_indices = np.array(trench_point_indices, dtype=np.int32)
-        self.trench_lengths = trench_lengths
+        # self.trench_point_types = np.array(trench_point_types, dtype=np.int32)
+        # self.trench_point_indices = np.array(trench_point_indices, dtype=np.int32)
+        # self.trench_lengths = trench_lengths
         self.circuit_trenches = circuit_trenches
         self.vault_circuit_connection = vault_circuit_connection
 
         return 0
 
-
-    def estimate_ghe_cost(self):
-        pass
-
-
-    def path_calculation(self, point_array1: np.array, point_array2: np.array):
+    def path_calculation(self, point_array1: np.array, point_array2: np.array, pathfinding=True):
 
         number_of_p1s = len(point_array1)
         number_of_p2s = len(point_array2)
@@ -390,13 +786,62 @@ class PipeNetwork:
         point_paths = [ [[] for j in range(number_of_p2s)] for i in range(number_of_p1s)]
         path_distances = np.zeros((number_of_p1s, number_of_p2s), dtype=np.double)
 
-        for i in range(number_of_p1s):
-            p1 = point_array1[i]
-            for j in range(number_of_p2s):
-                p2 = point_array2[j]
-                path_distances[i][j] = self.euler_distance(p1, p2)
-                point_paths[i][j].extend([p1, p2])
-        # point_paths = np.array(point_paths)
+
+
+        if not pathfinding:
+            for i in range(number_of_p1s):
+                for j in range(number_of_p2s):
+                    dist = self.euler_distance(point_array1[i], point_array2[j])
+                    path_distances[i][j] = dist
+        else:
+            # For each given point, determine the closest point to it on the pipe routing grid.
+            closest_point_1 = np.zeros(number_of_p1s, dtype=np.int32)
+            closest_point_2 = np.zeros(number_of_p2s, dtype=np.int32)
+
+            for j in range(len(point_array1)):
+                point = point_array1[j]
+                minimum_distance = float('inf')
+                closest_grid_point_ind = None
+                for i in range(len(self.pipe_routing_grid_points)):
+                    grid_location = self.pipe_routing_grid_points[i]
+                    distance = self.euler_distance(point, grid_location)
+                    if distance < minimum_distance:
+                        minimum_distance = distance
+                        closest_grid_point_ind = i
+                closest_point_1[j] = closest_grid_point_ind
+
+            for j in range(len(point_array2)):
+                point = point_array2[j]
+                minimum_distance = float('inf')
+                closest_grid_point_ind = None
+                for i in range(len(self.pipe_routing_grid_points)):
+                    grid_location = self.pipe_routing_grid_points[i]
+                    distance = self.euler_distance(point, grid_location)
+                    if distance < minimum_distance:
+                        minimum_distance = distance
+                        closest_grid_point_ind = i
+                closest_point_2[j] = closest_grid_point_ind
+
+            # For each combination of points, trace a path between the two selected points
+            # on the pipe routing grid.
+            grid_predecessors = self.pipe_routing_grid_path_predecessors
+            grid_distances = self.pipe_routing_grid_distances
+            for i in range(number_of_p1s):
+                closest_grid_point_ind_1 = closest_point_1[i]
+                for j in range(number_of_p2s):
+                    closest_grid_point_ind_2 = closest_point_2[j]
+                    goal_node = closest_grid_point_ind_2
+                    current_node = closest_grid_point_ind_1
+                    path_distances[i][j] = grid_distances\
+                        [closest_grid_point_ind_1][closest_grid_point_ind_2]
+                    while current_node != goal_node:
+                        point_paths[i][j].append(current_node)
+                        self.pipe_routing_grid_points_used[current_node] = True
+                        if current_node == -9999:
+                            print('Halt!!!')
+                        current_node = grid_predecessors[goal_node, current_node]
+                    point_paths[i][j].append(goal_node)
+
         return path_distances, point_paths
 
 
@@ -429,8 +874,28 @@ class PipeNetwork:
                 distance_sums[local_coord_index, cluster] = distance_sum
         return distance_sums
 
+    '''def cluster_distances(self, coords, borehole_clusters, number_of_clusters, cluster_count):
+        number_of_points = len(coords)
+        cluster_distances = np.zeros((number_of_points, number_of_clusters))
+        coordinates_by_cluster = [[] for i in range(number_of_clusters)]
+        for i in range(number_of_clusters):
+            for j in range(number_of_points):
+                if borehole_clusters[j] == i:
+                    coordinates_by_cluster[i].append(coords[j])
+        for i in range(number_of_points):
+            for j in range(number_of_clusters):
+                distance_sums = np.sum([self.euler_distance(coords[i],
+                                                cluster_coord) for
+                                        cluster_coord in coordinates_by_cluster[j]])
+                number_in_cluster = None
+                if j == borehole_clusters[i]:
+                    number_in_cluster = cluster_count[j] - 1
+                else:
+                    number_in_cluster = cluster_count[j]
+                cluster_distances[i][j] = distance_sums / float(number_in_cluster)
+        return cluster_distances'''
 
-    def k_mean_clustering(self, coord_inds: np.array, points_per_cluster, max_iter: int=10, clustering_seed: int=None):
+    def k_mean_clustering(self, coord_inds: np.array, points_per_cluster, max_iter: int=100, clustering_seed: int=None):
 
         if clustering_seed is not None:
             np.random.seed(clustering_seed)
@@ -465,7 +930,7 @@ class PipeNetwork:
 
                 closest_centroid = np.where(
                     dist[coord_to_transfer] == dist[coord_to_transfer].min(
-                        where=cluster_not_full, initial=float('inf')))[0]
+                        where=cluster_not_full, initial=float('inf')))[0][0]
                 borehole_clusters[coord_to_transfer] = closest_centroid
                 boreholes_included[coord_to_transfer] = True
                 cluster_count[closest_centroid] += 1
@@ -489,6 +954,7 @@ class PipeNetwork:
 
             # Get Distance Between Each Datapoint and The Cluster Means
             # dist = self.distance_subset_sums(coord_inds, borehole_clusters, num_of_clusters)
+            # dist = self.cluster_distances(coords, borehole_clusters, num_of_clusters, cluster_count)
             dist, paths = self.path_calculation(coords, c_means)
 
             # Sort Data Based on the Difference Between the Distance of Their Current Assignment vs. Their Optimal One
@@ -515,23 +981,23 @@ class PipeNetwork:
                     element_swapped[coord_to_swap] = True
                     cluster_count[preferred_clusters[0]] += 1
                     swap_made = True
-                    continue
-                # for preferred_cluster in preferred_clusters:
-                for other_coord_to_swap in coord_swap_order:
-                    if element_moved:
-                        break
-                    if other_coord_to_swap == coord_to_swap:
-                        continue
-                    other_cluster = borehole_clusters[other_coord_to_swap]
-                    gain2 = dist[other_coord_to_swap][other_cluster] - dist[other_coord_to_swap][current_cluster]
-                    gain1 = dist1 - dist[coord_to_swap][other_cluster]
-                    if gain1 + gain2 > 0:
-                        borehole_clusters[coord_to_swap] = other_cluster
-                        borehole_clusters[other_coord_to_swap] = current_cluster
-                        element_swapped[coord_to_swap] = True
-                        element_swapped[other_coord_to_swap] = True
-                        element_moved = True
-                        swap_made = True
+                else:
+                    # for preferred_cluster in preferred_clusters:
+                    for other_coord_to_swap in coord_swap_order:
+                        if element_moved:
+                            break
+                        if other_coord_to_swap == coord_to_swap:
+                            continue
+                        other_cluster = borehole_clusters[other_coord_to_swap]
+                        gain2 = dist[other_coord_to_swap][other_cluster] - dist[other_coord_to_swap][current_cluster]
+                        gain1 = dist1 - dist[coord_to_swap][other_cluster]
+                        if gain1 + gain2 > 0:
+                            borehole_clusters[coord_to_swap] = other_cluster
+                            borehole_clusters[other_coord_to_swap] = current_cluster
+                            element_swapped[coord_to_swap] = True
+                            element_swapped[other_coord_to_swap] = True
+                            element_moved = True
+                            swap_made = True
             iteration += 1
             if not swap_made:
                 break
@@ -571,6 +1037,259 @@ class PipeNetwork:
 
         return centroids
 
+    def generate_borehole_network(self, fluid_temperature, design_height, burial_depth, pp_network,
+                                  nominal_pressure=1.0, pipe_diameter=.5):
+
+        # creating borehole junctions
+        entry_junction = pp.create_junction(pp_network, pn_bar=nominal_pressure, height_m=-burial_depth,
+                                            tfluid_k=fluid_temperature)
+        bottom_junction = pp.create_junction(pp_network, pn_bar=nominal_pressure,
+                                             height_m=-burial_depth - design_height,
+                                             tfluid_k=fluid_temperature)
+        exit_junction = pp.create_junction(pp_network, pn_bar=nominal_pressure, height_m=-burial_depth,
+                                           tfluid_k=fluid_temperature)
+
+        # creating borehole pipes
+        entry_pipe, exit_pipe = pp.create_pipes_from_parameters(pp_network, [entry_junction, bottom_junction],
+                                                                [bottom_junction, exit_junction],
+                                                                length_km=design_height / 1000,
+                                                                diameter_m=pipe_diameter)
+
+        return [entry_junction, bottom_junction, exit_junction], [entry_pipe, exit_pipe]
+
+
+    def size_pipe_network(self):
+
+        # Constants and Conversion Factors
+        accel_of_gravity = 32.2 # in ft/s^2
+        standard_temperature = 293.15 # in K
+        slugft3_to_kgm3 = 515.379
+        psf_per_bar = 2088.5434273039364
+        standard_pressure = 1.0
+
+        available_pipe_sizes = self.pipe_size_data["Size"]
+
+        # Beginning Diameter
+        initial_diameter = np.max(available_pipe_sizes)
+
+        net = pp.create_empty_network(fluid="water")  # Create an empty pipe network.
+        fluid_density = net["fluid"].get_density(standard_temperature) / slugft3_to_kgm3
+
+        # Convert the given pressure drops (in ft) to bar
+        max_ghe_pressure_drop_bar = self.max_ghe_pressure_drop *\
+                                         (fluid_density * accel_of_gravity) / psf_per_bar
+
+        # Getting Design Information
+        #burial_depth = self.ghe.GFunction.D_values[0]
+        #design_height = self.ghe.averageHeight()
+        #borehole_pipe_diameter = self.ghe.pipe.r_in * 2
+        burial_depth = 2
+        design_height = 100
+        flowrate_per_borehole = .2
+        borehole_pipe_diameter = 2 * .075
+        # flowrate_per_borehole = self.ghe.m_flow_borehole
+
+        ghe_ingress = pp.create_junction(net, height_m=-burial_depth,
+                                         tfluid_k=standard_temperature, pn_bar=standard_pressure)
+        ghe_egress = pp.create_junction(net, height_m=-burial_depth,
+                                        tfluid_k=standard_temperature, pn_bar=standard_pressure)
+
+        # Create Borehole Pipes and Junctions
+        borehole_junctions = []
+        borehole_pipes = []
+        for i in range(self.NBH):
+
+            single_borehole_junctions, single_borehole_pipes =\
+                self.generate_borehole_network(standard_temperature, design_height,
+                                                burial_depth, net,
+                                               pipe_diameter=borehole_pipe_diameter)
+            borehole_junctions.append(single_borehole_junctions)
+            borehole_pipes.append(single_borehole_pipes)
+
+        # Create Vault Junctions
+        vault_in_junctions = []
+        vault_out_junctions = []
+        for i in range(len(self.vault_clusters)):
+            vault_in_junctions.append(pp.create_junction(net,
+                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
+            vault_out_junctions.append(pp.create_junction(net,
+                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
+
+        # Create Routing Junctions (for routing)
+        relay_in_junctions = []
+        relay_out_junctions = []
+        junction_to_relay_indices = []
+        for i in range(len(self.pipe_routing_grid_points)):
+            current_point = self.pipe_routing_grid_points[i]
+            if self.pipe_routing_grid_points_used[i]:
+                relay_in_junctions.append(pp.create_junction(net,
+                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                relay_out_junctions.append(pp.create_junction(net,
+                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                junction_to_relay_indices.append(i)
+        junction_to_relay_indices = np.array(junction_to_relay_indices)
+            
+
+        total_number_of_junctions = (len(borehole_junctions) + len(relay_in_junctions))
+
+        # Create the pipe connections between boreholes and relay points. Currently, this assumes a
+        # direct return system. This is b/c a reverse return system requires a set of logic to determine
+        # which directions in a trench go towards or away from the root. This should be possible, but will
+        # be excluded for the moment. A direct return is simpler as the in and out junctions can all be directly
+        # connected although this might lead to balancing issues.
+
+        # Every Trench Represents the need for an in and an out pipe. These pipes are called 'header' pipes.
+        header_pipes = []
+        for trench in self.trenches: # Construct the pipes
+
+            trench_dict = self.trenches[trench]
+            pipe_length = trench_dict["length"]
+            p1_type = trench_dict["connection_types"][0]
+            p2_type = trench_dict["connection_types"][1]
+            p1_index = trench_dict["connection_indices"][0]
+            p2_index = trench_dict["connection_indices"][1]
+
+            p1_in_junction = None
+            p2_in_junction = None
+            p1_out_junction = None
+            p2_out_junction = None
+            if p1_type == 1:
+                p1_in_junction = ghe_ingress
+                p1_out_junction = ghe_egress
+            elif p1_type == 2:
+                p1_in_junction = vault_in_junctions[p1_index]
+                p1_out_junction = vault_out_junctions[p1_index]
+            elif p1_type == 3:
+                adjusted_relay_index = np.where(p1_index == junction_to_relay_indices)[0][0]
+                p1_in_junction = relay_in_junctions[adjusted_relay_index]
+                p1_out_junction = relay_out_junctions[adjusted_relay_index]
+            elif p1_type == 4:
+                p1_in_junction = borehole_junctions[p1_index][0]
+                p1_out_junction = borehole_junctions[p1_index][1]
+            if p2_type == 1:
+                p2_in_junction = ghe_ingress
+                p2_out_junction = ghe_egress
+            elif p2_type == 2:
+                p2_in_junction = vault_in_junctions[p2_index]
+                p2_out_junction = vault_out_junctions[p2_index]
+            elif p2_type == 3:
+                adjusted_relay_index = np.where(p2_index == junction_to_relay_indices)
+                adjusted_relay_index = adjusted_relay_index[0][0]
+                p2_in_junction = relay_in_junctions[adjusted_relay_index]
+                p2_out_junction = relay_out_junctions[adjusted_relay_index]
+            elif p2_type == 4:
+                p2_in_junction = borehole_junctions[p2_index][0]
+                p2_out_junction = borehole_junctions[p2_index][1]
+
+            pipe_pair = []
+            pipe_pair.append(pp.create_pipe_from_parameters(net, p1_in_junction, p2_in_junction,
+                                                                length_km=pipe_length / 1000,
+                                                                diameter_m=initial_diameter))
+            pipe_pair.append(pp.create_pipe_from_parameters(net, p1_out_junction, p2_out_junction,
+                                                            length_km=pipe_length / 1000,
+                                                            diameter_m=initial_diameter))
+            header_pipes.append(pipe_pair)
+        # Constrain system based on flow and pressure requirements.
+        pressure_grid = pp.create_ext_grid(net, ghe_ingress, juntion=ghe_ingress, p_bar=max_ghe_pressure_drop_bar,
+                                           t_k=standard_temperature)
+        total_flowrate = flowrate_per_borehole * len(self.coords)
+        exit_sink = pp.create_sink(net, junction=ghe_egress, mdot_kg_per_s=total_flowrate, name="GHE Egress")
+
+
+        # The current pipe sizing works as follows:
+        # 1. The pipe sizes for the boreholes is predetermined from the thermal analysis *completed
+        # 2. All of the header pipes are set to the maximum available pipe diameter. *completed
+        # 3. A binary search is performed over the pipe diameters where all the header pipes
+        # are set to the same diameter each step. The goal is to find the minimum diameter possible
+        # for which the total pressure drop across the system is still below the given pressure drop.
+        # 4. Next the pipe diameters are refined by decreasing the pipe pair with the highest flowrate
+        # for each step until the pressure drop prevents any further decreases.
+
+        # First ensure that the constraints can be met with the maximum pipe size.
+        pp.pipeflow(net)
+        if min(net.res_junction['p_bar']) < 0:
+            raise ValueError('Given pressure constraints cannot be met with given borehole pipe'
+                             'size and maximum header pipe size.')
+
+        # 3.
+        selected_pipe_size = 0
+        previous_lower_pipe_size = -1
+        previous_upper_pipe_size = -1
+        lower_pipe_size = 0
+        upper_pipe_size = len(available_pipe_sizes) - 1
+        maximum_iter = 100
+        iter = 0
+        while ((lower_pipe_size != previous_lower_pipe_size) or \
+                (upper_pipe_size != previous_upper_pipe_size)) and iter < maximum_iter:
+            for pipe_pair in header_pipes:
+                net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[selected_pipe_size]
+                net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[selected_pipe_size]
+            pp.pipeflow(net)
+            if min(net.res_junction['p_bar']) < 0:
+                previous_lower_pipe_size = lower_pipe_size
+                lower_pipe_size = selected_pipe_size
+            else:
+                previous_upper_pipe_size = upper_pipe_size
+                upper_pipe_size = selected_pipe_size
+            selected_pipe_size = int(floor(0.5 * (upper_pipe_size + lower_pipe_size)))
+            iter += 1
+        selected_pipe_size = upper_pipe_size
+
+        # Update the pipe sizes to the selected one.
+        for pipe_pair in header_pipes:
+            net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[selected_pipe_size]
+            net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[selected_pipe_size]
+        pp.pipeflow(net)
+
+        # Calculate Flow Imbalance
+        borehole_pipe_flowrates = []
+        for borehole_pipe in borehole_pipes:
+            borehole_pipe_ind = borehole_pipe[0]
+            borehole_pipe_flowrates.append(abs(net.res_pipe['mdot_to_kg_per_s'][borehole_pipe_ind]))
+        print("Maximum Flow Imbalance of: ", str(np.max(borehole_pipe_flowrates)
+                                                 - np.min(borehole_pipe_flowrates)))
+        print("Maximum Borehole Flowrate of: ", str(np.max(borehole_pipe_flowrates)))
+        print("Minimum Borehole Flowrate of: ", str(np.min(borehole_pipe_flowrates)))
+
+        '''
+        # 4.
+
+        # Generate list tracking the sizes of each pipe
+        header_pipe_sizes = np.array([selected_pipe_size for pipe_pair in header_pipes])
+        pipes_available_to_change = np.array([True for pipe_pair in header_pipes])
+
+        iter = 0
+        while (pipes_available_to_change.any() == True) and iter < maximum_iter:
+            pipe_flowrates = net.res_pipe['mdot_to_kg_per_s'].abs()
+            pipes_sorted_by_flowrate = np.flip(np.argsort(pipe_flowrates))
+            move_to_next_loop = False
+            for pipe_index in pipes_sorted_by_flowrate:
+                if pipes_available_to_change[pipe_index]:
+                    pipe_pair = header_pipes[pipe_index]
+                    new_pipe_size = header_pipe_sizes[pipe_index] - 1
+                    net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[new_pipe_size]
+                    net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[new_pipe_size]
+                    pp.pipeflow(net)
+                    if min(net.res_junction['p_bar']) < 0:
+                        pipes_available_to_change[pipe_index] = False
+                        net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[new_pipe_size + 1]
+                        net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[new_pipe_size + 1]
+                        pp.pipeflow(net)
+                    else:
+                        move_to_next_loop = True
+                if move_to_next_loop:
+                    break
+        '''
+
+
+
+
+        # Store pipeflow net
+        self.net = net
+
+
+    def estimate_ghe_cost(self):
+        pass
 
 
 

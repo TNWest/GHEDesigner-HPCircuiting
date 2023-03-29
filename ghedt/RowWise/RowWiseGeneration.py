@@ -119,7 +119,7 @@ def fieldOptimization_FR(
     ngZones=None,
     rotateStart=None,
     rotateStop=None,
-    intersection_tolerance=1e-5,
+    intersection_tolerance=1e-10,
 ):
     """Optimizes a Field by iterating over input values w/o perimeter spacing
 
@@ -640,6 +640,29 @@ def genBoreHoleConfig(
                 if len(boreHoles)==0 or not (boreHoles[len(boreHoles) - 1][0] == highestVert[0] and boreHoles[len(boreHoles) - 1][1] ==highestVert[1]):
                     boreHoles[len(boreHoles)] = highestVert
         """
+        if len(finters) > 2:
+            for i in range(flen - 1):
+                spac = float(
+                    sqrt(
+                        (finters[i + 1][0] - finters[i][0]) * (finters[i + 1][0] - finters[i][0])
+                        + (finters[i + 1][1] - finters[i][1]) * (finters[i + 1][1] - finters[i][1])
+                    )
+                )
+                if spac < XSpac:
+                    inone = False
+                    if not field.pointintersect(
+                            [
+                                (finters[i][0]+finters[i + 1][0])/2.0,
+                                (finters[i][1]+finters[i + 1][1])/2.0,
+                            ]
+                    ):
+                        inone = True
+                    if inone:
+                            d = (XSpac - spac) / 2
+                            finters[i + 1][0] += d * cos(rotate)
+                            finters[i + 1][1] += d * sin(rotate)
+                            finters[i][0] -= d * cos(rotate)
+                            finters[i][1] -= d * sin(rotate)
         # Handles cases with odd number of intersections
         if flen % 2 == 0:
 
@@ -669,7 +692,7 @@ def genBoreHoleConfig(
 
                 leftOffset = [0, 0]
                 rightOffset = [0, 0]
-
+                '''
                 # Checks if there is enough distance between this point and another and then will offset the point if there is not enough room
                 if (
                     i > 0
@@ -698,6 +721,7 @@ def genBoreHoleConfig(
                     < XSpac
                 ):
                     rightOffset = [-drs * cos(rotate), -drs * sin(rotate)]
+                '''
 
                 ProcessRows(
                     row,
@@ -884,12 +908,12 @@ def ProcessRows(
         if spac < rowspace:
             inone = False
             for shape in nogo:
-                if shape.pointintersect(
+                if len(shape.pointintersect(
                     [
-                        (inters[i + 1][0] + inters[i][0]) / 2,
-                        (inters[i + 1][1] + inters[i][1]) / 2,
+                        (inters[i][0] + inters[i + 1][0]) * 0.5,
+                        (inters[i][1] + inters[i + 1][1]) * 0.5
                     ]
-                ):
+                )) > 0:
                     inone = True
             if inone:
                 d = (rowspace - spac) / 2

@@ -12,6 +12,7 @@ from scipy.sparse import csgraph
 from scipy.sparse import csr_matrix
 from ghedt.RowWise.Shape import Shapes
 import pandapipes as pp
+import csv
 
 # from ghedt.RowWise.Shape import Shapes # needed for future updates
 
@@ -25,6 +26,7 @@ class PipeNetwork:
 
         # Load Cost and Pipe Size Data
         self.pipe_size_data = pd.read_csv(self.pipe_size_data_filename)
+        self.pipe_size_data_dict = dict(list(self.pipe_size_data.values))
         self.cost_data = pd.read_csv(self.cost_data_filename)
 
         # Convert the given property boundary and nogo zones into Shape objects
@@ -56,6 +58,7 @@ class PipeNetwork:
         assert "max_ghe_pressure_drop" in kwargs
         assert "property_boundary" in kwargs
         assert "nogo_zones" in kwargs
+        assert "design_height" in kwargs
 
 
         # Check that all inputs are the correct datatype, and assign them to a property.
@@ -78,6 +81,9 @@ class PipeNetwork:
         assert all(isinstance(val, list) for val in kwargs["property_boundary"])
         assert all(isinstance(val, float) for point in kwargs["property_boundary"] for val in point)
         self.property_boundary = kwargs["property_boundary"]
+
+        assert isinstance(kwargs["design_height"], float)
+        self.design_height = kwargs["design_height"]
 
         if "nogo_zones" in kwargs:
             assert isinstance(kwargs["nogo_zones"], list)
@@ -111,6 +117,15 @@ class PipeNetwork:
         assert isinstance(kwargs["cost_data_filename"], str)
         assert isfile(kwargs["cost_data_filename"])
         self.cost_data_filename = kwargs["cost_data_filename"]
+        with open(self.cost_data_filename, "r") as cost_input:
+            csv_reader = csv.reader(cost_input)
+            cost_input_array = []
+            for line in csv_reader:
+                cost_input_array.append(line[1])
+            self.fixed_borehole_cost = float(cost_input_array[0])
+            self.drilling_cost = float(cost_input_array[1])
+            self.trenching_cost = float(cost_input_array[2])
+
 
         assert isinstance(kwargs["pipe_size_data_filename"], str)
         assert isfile(kwargs["pipe_size_data_filename"])
@@ -541,21 +556,24 @@ class PipeNetwork:
         worksheet_2b.insert_chart(3, 10, s2b_chart_1)
 
 
+        # The next sheets will represent the pipe information for each circuit.
+        circuit_number = 0
+        for net in self.pipe_networks:
+            # Sheet 4 contains the pipe junction information
+            sheet_4_name = "Pipe_Junction_Info_" + str(circuit_number)
+            sheet_4_frame = net.res_junction
+            sheet_4_frame.to_excel(writer, sheet_name=sheet_4_name)
 
-        # Sheet 4 contains the pipe junction information
-        sheet_4_name = "Pipe_Junction_Info"
-        sheet_4_frame = self.net.res_junction
-        sheet_4_frame.to_excel(writer, sheet_name=sheet_4_name)
+            # Sheet 5 contains the pipe flow information
+            sheet_5_name = "Pipe_Flow_Info_" + str(circuit_number)
+            sheet_5_frame = net.res_pipe
+            sheet_5_frame.to_excel(writer, sheet_name=sheet_5_name)
 
-        # Sheet 5 contains the pipe flow information
-        sheet_5_name = "Pipe_Flow_Info"
-        sheet_5_frame = self.net.res_pipe
-        sheet_5_frame.to_excel(writer, sheet_name=sheet_5_name)
-
-        # Sheet 6 contains the pipe size information
-        sheet_6_name = "Pipe_Size_Info"
-        sheet_6_frame = self.net.pipe
-        sheet_6_frame.to_excel(writer, sheet_name=sheet_6_name)
+            # Sheet 6 contains the pipe size information
+            sheet_6_name = "Pipe_Size_Info_" + str(circuit_number)
+            sheet_6_frame = net.pipe
+            sheet_6_frame.to_excel(writer, sheet_name=sheet_6_name)
+            circuit_number += 1
 
 
 
@@ -712,6 +730,7 @@ class PipeNetwork:
         # trench_lengths = []
         circuit_trenches = []
         vault_circuit_connection = []
+        circuit_topology_information = []
 
         # Create Trench Network Vault-by-vault and circuit-by-circuit
         for vault_number in range(self.number_of_vaults):
@@ -733,8 +752,16 @@ class PipeNetwork:
                             vault_number)
             circuit_trenches.append([])
             vault_circuit_connection.append([])
+            circuit_topology_information_by_vault = []
 
             for circuit_number in range(max(self.circuit_clusters[vault_number]) + 1):
+
+                circuit_graph_connections = [] # encoding scheme: (other connection point, weight of connection)
+                # [This is a list of tuples]
+                circuit_point_types = [] # This is a list where each element corresponds to the type of point for
+                number_of_connections = []
+                boreholes_included = []
+                borehole_indices = []
 
                 # Get Boreholes that are a part of this circuit
                 circuit_inds = np.where(circuit_number == vault_circuit_clusters)[0]
@@ -742,30 +769,149 @@ class PipeNetwork:
 
                 # Place a trench between the current vault and the closest borehole of the current circuit
                 dist, path = self.path_calculation(circuit_coords, [vault_location])
+
+                circuit_point_types.append(2)
+                circuit_graph_connections.append([])
+                number_of_connections.append(0)
+
                 closest_borehole = np.where(dist == dist.min())[0][0]
                 vault_node_connection = vault_indices[circuit_inds[closest_borehole]]
                 self.add_trench(4, vault_node_connection, 3, path[closest_borehole][0][0])
+
+
+                # circuit_graph_connections[0].append(1, )
+                circuit_point_types.append(3)
+                circuit_graph_connections.append([])
+                number_of_connections.append(0)
+
                 if len(path[closest_borehole][0]) > 1:
                     for i in range(len(path[closest_borehole][0]) - 1):
                         self.add_trench(3, path[closest_borehole][0][i], 3,
                                         path[closest_borehole][0][i + 1])
+
+                        circuit_point_types.append(3)
+                        circuit_graph_connections.append([])
+                        number_of_connections.append(0)
+
+                        trench_length = self.euler_distance(self.get_point(3, path[closest_borehole][0][i]),
+                                                            self.get_point(3, path[closest_borehole][0][i + 1]))
+
+                        circuit_graph_connections[i + 1].append([i + 2,
+                                                        trench_length])
+                        number_of_connections[i+1] += 1
+                        number_of_connections[i+2] += 1
+
                 self.add_trench(3, path[closest_borehole][0][-1], 2, vault_number)
+
+                trench_length = self.euler_distance(self.get_point(2, vault_number),
+                                                    self.get_point(3, path[closest_borehole][0][-1]))
+                circuit_graph_connections[0].append([len(path[closest_borehole][0]),
+                                                        trench_length])
+                number_of_connections[0] += 1
+                number_of_connections[len(path[closest_borehole][0])] += 1
+
+                circuit_point_types.append(4)
+                circuit_graph_connections.append([])
+                number_of_connections.append(0)
+                boreholes_included.append(vault_node_connection)
+                borehole_indices.append(len(circuit_graph_connections) - 1)
+
+                trench_length = self.euler_distance(self.get_point(4, vault_node_connection),
+                                                    self.get_point(3, path[closest_borehole][0][0]))
+                circuit_graph_connections[-1].append([1,
+                                                    trench_length])
+                number_of_connections[-1] += 1
+                number_of_connections[1] += 1
+
+
                 vault_circuit_connection[vault_number].append(vault_node_connection)
 
                 # Place trenches to form the minimum spanning tree of the current circuit
                 circuit_trench_network, path = self.minimum_spanning_tree(vault_indices[circuit_inds])
                 circuit_trenches[vault_number].append(circuit_trench_network)
                 number_of_points = len(circuit_trench_network) # square array
+                connections_included = {}
+                for p1 in range(number_of_points):
+                    connections_included[p1] = {}
+                    for p2 in range(number_of_points):
+                        connections_included[p1][p2] = False
                 for p1 in range(number_of_points):
                     for p2 in range(number_of_points):
+                        if connections_included[p1][p2] or connections_included[p2][p1]:
+                            continue
                         connection = circuit_trench_network[p1][p2]
                         if connection != 0: # A valid connection will have a non-zero distance
+                            connections_included[p1][p2] = True
                             self.add_trench(4, vault_indices[circuit_inds[p1]], 3, path[p1][p2][0])
+
+                            if not vault_indices[circuit_inds[p1]] in boreholes_included:
+                                circuit_point_types.append(4)
+                                circuit_graph_connections.append([])
+                                number_of_connections.append(0)
+                                boreholes_included.append(vault_indices[circuit_inds[p1]])
+                                borehole_indices.append(len(circuit_graph_connections) - 1)
+
+                            circuit_point_types.append(3)
+                            circuit_graph_connections.append([])
+                            number_of_connections.append(0)
+
+                            trench_length = self.euler_distance(self.get_point(4, vault_indices[circuit_inds[p1]]),
+                                                                self.get_point(3, path[p1][p2][0]))
+                            circuit_graph_connections[-1].append([borehole_indices[boreholes_included \
+                                                                 .index(vault_indices[circuit_inds[p1]])],
+                                                                 trench_length])
+                            number_of_connections[-1] += 1
+                            number_of_connections[borehole_indices[boreholes_included \
+                                                                 .index(vault_indices[circuit_inds[p1]])]] += 1
+
                             if len(path[p1][p2]) > 1:
                                 for i in range(len(path[p1][p2]) - 1):
                                     self.add_trench(3, path[p1][p2][i], 3,
                                                     path[p1][p2][i + 1])
+
+                                    circuit_point_types.append(3)
+                                    circuit_graph_connections.append([])
+                                    number_of_connections.append(0)
+
+                                    trench_length = self.euler_distance(self.get_point(3, path[p1][p2][i]),
+                                                                        self.get_point(3, path[p1][p2][
+                                                                            i + 1]))
+
+                                    circuit_graph_connections[-2].append([len(circuit_graph_connections)-1,
+                                                                            trench_length])
+                                    number_of_connections[-2] += 1
+                                    number_of_connections[-1] += 1
+                            borehole_added = False
+                            if not vault_indices[circuit_inds[p2]] in boreholes_included:
+                                borehole_added = True
+                                circuit_point_types.append(4)
+                                circuit_graph_connections.append([])
+                                number_of_connections.append(0)
+                                boreholes_included.append(vault_indices[circuit_inds[p2]])
+                                borehole_indices.append(len(circuit_graph_connections) - 1)
+
                             self.add_trench(3, path[p1][p2][-1], 4, vault_indices[circuit_inds[p2]])
+
+                            trench_length = self.euler_distance(self.get_point(4, vault_indices[circuit_inds[p2]]),
+                                                                self.get_point(3, path[p1][p2][0]))
+
+                            last_relay_index = None
+                            if borehole_added:
+                                last_relay_index = -2
+                            else:
+                                last_relay_index = -1
+                            circuit_graph_connections[last_relay_index].append([borehole_indices[boreholes_included \
+                                                                 .index(vault_indices[circuit_inds[p2]])],
+                                                                  trench_length])
+                            number_of_connections[last_relay_index] += 1
+                            number_of_connections[borehole_indices[boreholes_included \
+                                .index(vault_indices[circuit_inds[p2]])]] += 1
+                circuit_topology_information_by_vault.append([circuit_point_types,
+                                                              number_of_connections, circuit_graph_connections])
+
+
+
+            circuit_topology_information.append(circuit_topology_information_by_vault)
 
 
         # Convert lists to numpy arrays and store them
@@ -774,6 +920,7 @@ class PipeNetwork:
         # self.trench_lengths = trench_lengths
         self.circuit_trenches = circuit_trenches
         self.vault_circuit_connection = vault_circuit_connection
+        self.circuit_topology_information = circuit_topology_information
 
         return 0
 
@@ -1067,7 +1214,7 @@ class PipeNetwork:
         psf_per_bar = 2088.5434273039364
         standard_pressure = 1.0
 
-        available_pipe_sizes = self.pipe_size_data["Size"]
+        available_pipe_sizes = self.pipe_size_data["Inner Diameter (m)"]
 
         # Beginning Diameter
         initial_diameter = np.max(available_pipe_sizes)
@@ -1078,178 +1225,182 @@ class PipeNetwork:
         # Convert the given pressure drops (in ft) to bar
         max_ghe_pressure_drop_bar = self.max_ghe_pressure_drop *\
                                          (fluid_density * accel_of_gravity) / psf_per_bar
+        print("Maximum Pressure Drop in Bar: ", max_ghe_pressure_drop_bar)
 
         # Getting Design Information
         #burial_depth = self.ghe.GFunction.D_values[0]
         #design_height = self.ghe.averageHeight()
         #borehole_pipe_diameter = self.ghe.pipe.r_in * 2
         burial_depth = 2
-        design_height = 100
+        design_height = self.design_height
         flowrate_per_borehole = .2
-        borehole_pipe_diameter = 2 * .075
+        borehole_pipe_diameter = 0.0215396
         # flowrate_per_borehole = self.ghe.m_flow_borehole
 
-        ghe_ingress = pp.create_junction(net, height_m=-burial_depth,
-                                         tfluid_k=standard_temperature, pn_bar=standard_pressure)
-        ghe_egress = pp.create_junction(net, height_m=-burial_depth,
-                                        tfluid_k=standard_temperature, pn_bar=standard_pressure)
+        circuit_pipe_networks = []
 
-        # Create Borehole Pipes and Junctions
-        borehole_junctions = []
-        borehole_pipes = []
-        for i in range(self.NBH):
+        circuit_topology_information = self.circuit_topology_information
+        for vault_number in range(len(self.circuit_topology_information)):
+            for circuit_number in range(len(self.circuit_topology_information[vault_number])):
+                circuit_point_types, number_of_connections, circuit_graph_connections =\
+                    self.circuit_topology_information[vault_number][circuit_number]
 
-            single_borehole_junctions, single_borehole_pipes =\
-                self.generate_borehole_network(standard_temperature, design_height,
-                                                burial_depth, net,
-                                               pipe_diameter=borehole_pipe_diameter)
-            borehole_junctions.append(single_borehole_junctions)
-            borehole_pipes.append(single_borehole_pipes)
+                net = pp.create_empty_network(fluid="water")  # Create an empty pipe network.
 
-        # Create Vault Junctions
-        vault_in_junctions = []
-        vault_out_junctions = []
-        for i in range(len(self.vault_clusters)):
-            vault_in_junctions.append(pp.create_junction(net,
-                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
-            vault_out_junctions.append(pp.create_junction(net,
-                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                ghe_ingress = pp.create_junction(net, height_m=-burial_depth,
+                                                 tfluid_k=standard_temperature, pn_bar=standard_pressure)
+                ghe_egress = pp.create_junction(net, height_m=-burial_depth,
+                                                tfluid_k=standard_temperature, pn_bar=standard_pressure)
 
-        # Create Routing Junctions (for routing)
-        relay_in_junctions = []
-        relay_out_junctions = []
-        junction_to_relay_indices = []
-        for i in range(len(self.pipe_routing_grid_points)):
-            current_point = self.pipe_routing_grid_points[i]
-            if self.pipe_routing_grid_points_used[i]:
-                relay_in_junctions.append(pp.create_junction(net,
-                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
-                relay_out_junctions.append(pp.create_junction(net,
-                 height_m=-burial_depth, tfluid_k=standard_temperature, pn_bar=standard_pressure))
-                junction_to_relay_indices.append(i)
-        junction_to_relay_indices = np.array(junction_to_relay_indices)
-            
+                # Create Junctions
+                supply_nodes = []
+                exit_nodes = []
+                reverse_nodes = []
+                borehole_pipes = []
+                past_first_borehole = False
+                for circuit_point in circuit_point_types:
+                    # if circuit_point == 1:
+                    if circuit_point == 2:
+                        supply_nodes.append(ghe_ingress)
+                        exit_nodes.append(ghe_egress)
+                        reverse_nodes.append(None)
+                    elif circuit_point == 3:
+                        if past_first_borehole:
+                            reverse_nodes.append(pp.create_junction(net, height_m=-burial_depth,
+                                                 tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                        else:
+                            reverse_nodes.append(None)
+                        supply_nodes.append(pp.create_junction(net, height_m=-burial_depth,
+                                                 tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                        exit_nodes.append(pp.create_junction(net, height_m=-burial_depth,
+                                                 tfluid_k=standard_temperature, pn_bar=standard_pressure))
+                    elif circuit_point == 4:
+                        if not past_first_borehole:
+                            past_first_borehole = True
+                        b_junctions, b_pipes = self.generate_borehole_network(standard_temperature, design_height, burial_depth, net,
+                                                       pipe_diameter=borehole_pipe_diameter)
+                        borehole_pipes.extend(b_pipes)
+                        reverse_nodes.append(b_junctions[-1])
+                        supply_nodes.append(b_junctions[0])
+                        exit_nodes.append(pp.create_junction(net, height_m=-burial_depth,
+                                                 tfluid_k=standard_temperature, pn_bar=standard_pressure))
 
-        total_number_of_junctions = (len(borehole_junctions) + len(relay_in_junctions))
+                # Create Pipes
+                past_first_borehole = False
+                header_pipes = []
+                number_of_boreholes = 0
+                for i in range(len(circuit_point_types)):
+                    point_type = circuit_point_types[i]
+                    if point_type == 2:
+                        for trench in circuit_graph_connections[i]:
+                            other_node = trench[0]
+                            pipe_length = trench[1]
+                            header_pipes.extend([
+                            pp.create_pipe_from_parameters(net, supply_nodes[i], supply_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter),
+                            pp.create_pipe_from_parameters(net, exit_nodes[i], exit_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter)])
+                    elif point_type == 3:
+                        for trench in circuit_graph_connections[i]:
+                            other_node = trench[0]
+                            pipe_length = trench[1]
+                            if past_first_borehole and reverse_nodes[other_node] is not None:
+                                header_pipes.append(
+                                pp.create_pipe_from_parameters(net, reverse_nodes[i], reverse_nodes[other_node],
+                                                               length_km=pipe_length / 1000,
+                                                               diameter_m=initial_diameter))
+                            header_pipes.extend([
+                            pp.create_pipe_from_parameters(net, supply_nodes[i], supply_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter),
+                            pp.create_pipe_from_parameters(net, exit_nodes[i], exit_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter)])
+                    elif point_type == 4:
+                        number_of_boreholes += 1
+                        for trench in circuit_graph_connections[i]:
+                            other_node = trench[0]
+                            pipe_length = trench[1]
+                            if not past_first_borehole:
+                                past_first_borehole = True
+                            header_pipes.extend([
+                            pp.create_pipe_from_parameters(net, supply_nodes[i], supply_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter),
+                            pp.create_pipe_from_parameters(net, exit_nodes[i], exit_nodes[other_node],
+                                                           length_km=pipe_length / 1000,
+                                                           diameter_m=initial_diameter)])
+                            if reverse_nodes[other_node] is not None:
+                                header_pipes.append(
+                                    pp.create_pipe_from_parameters(net, reverse_nodes[i], reverse_nodes[other_node],
+                                                               length_km=pipe_length / 1000,
+                                                               diameter_m=initial_diameter))
+                        if number_of_connections[i] == 1:
+                            header_pipes.append(
+                            pp.create_pipe_from_parameters(net, exit_nodes[i], reverse_nodes[i],
+                                                           length_km=1 / 1000,
+                                                           diameter_m=initial_diameter))
+                sink = pp.create_sink(net, ghe_egress, flowrate_per_borehole * number_of_boreholes)
+                pressure_grid = pp.create_ext_grid(net, junction=ghe_ingress, p_bar=max_ghe_pressure_drop_bar)
+                pp.plotting.simple_plot(net, plot_sinks=True)
 
-        # Create the pipe connections between boreholes and relay points. Currently, this assumes a
-        # direct return system. This is b/c a reverse return system requires a set of logic to determine
-        # which directions in a trench go towards or away from the root. This should be possible, but will
-        # be excluded for the moment. A direct return is simpler as the in and out junctions can all be directly
-        # connected although this might lead to balancing issues.
+                # The current pipe sizing works as follows:
+                # 1. The pipe sizes for the boreholes is predetermined from the thermal analysis *completed
+                # 2. All of the header pipes are set to the maximum available pipe diameter. *completed
+                # 3. A binary search is performed over the pipe diameters where all the header pipes
+                # are set to the same diameter each step. The goal is to find the minimum diameter possible
+                # for which the total pressure drop across the system is still below the given pressure drop.
+                # 4. Next the pipe diameters are refined by decreasing the pipe pair with the highest flowrate
+                # for each step until the pressure drop prevents any further decreases.
 
-        # Every Trench Represents the need for an in and an out pipe. These pipes are called 'header' pipes.
-        header_pipes = []
-        for trench in self.trenches: # Construct the pipes
+                # First ensure that the constraints can be met with the maximum pipe size.
+                pp.pipeflow(net)
+                if min(net.res_junction['p_bar']) < 0:
+                    raise ValueError('Given pressure constraints cannot be met with given borehole pipe'
+                                     'size and maximum header pipe size.')
 
-            trench_dict = self.trenches[trench]
-            pipe_length = trench_dict["length"]
-            p1_type = trench_dict["connection_types"][0]
-            p2_type = trench_dict["connection_types"][1]
-            p1_index = trench_dict["connection_indices"][0]
-            p2_index = trench_dict["connection_indices"][1]
+                # 3.
+                selected_pipe_size = 0
+                previous_lower_pipe_size = -1
+                previous_upper_pipe_size = -1
+                lower_pipe_size = 0
+                upper_pipe_size = len(available_pipe_sizes) - 1
+                maximum_iter = 100
+                iter = 0
+                while ((lower_pipe_size != previous_lower_pipe_size) or \
+                        (upper_pipe_size != previous_upper_pipe_size)) and iter < maximum_iter:
+                    for pipe in header_pipes:
+                        net.pipe['diameter_m'][pipe] = available_pipe_sizes[selected_pipe_size]
+                    pp.pipeflow(net)
+                    if min(net.res_junction['p_bar']) < 0:
+                        previous_lower_pipe_size = lower_pipe_size
+                        lower_pipe_size = selected_pipe_size
+                    else:
+                        previous_upper_pipe_size = upper_pipe_size
+                        upper_pipe_size = selected_pipe_size
+                    selected_pipe_size = int(floor(0.5 * (upper_pipe_size + lower_pipe_size)))
+                    iter += 1
+                selected_pipe_size = upper_pipe_size
 
-            p1_in_junction = None
-            p2_in_junction = None
-            p1_out_junction = None
-            p2_out_junction = None
-            if p1_type == 1:
-                p1_in_junction = ghe_ingress
-                p1_out_junction = ghe_egress
-            elif p1_type == 2:
-                p1_in_junction = vault_in_junctions[p1_index]
-                p1_out_junction = vault_out_junctions[p1_index]
-            elif p1_type == 3:
-                adjusted_relay_index = np.where(p1_index == junction_to_relay_indices)[0][0]
-                p1_in_junction = relay_in_junctions[adjusted_relay_index]
-                p1_out_junction = relay_out_junctions[adjusted_relay_index]
-            elif p1_type == 4:
-                p1_in_junction = borehole_junctions[p1_index][0]
-                p1_out_junction = borehole_junctions[p1_index][1]
-            if p2_type == 1:
-                p2_in_junction = ghe_ingress
-                p2_out_junction = ghe_egress
-            elif p2_type == 2:
-                p2_in_junction = vault_in_junctions[p2_index]
-                p2_out_junction = vault_out_junctions[p2_index]
-            elif p2_type == 3:
-                adjusted_relay_index = np.where(p2_index == junction_to_relay_indices)
-                adjusted_relay_index = adjusted_relay_index[0][0]
-                p2_in_junction = relay_in_junctions[adjusted_relay_index]
-                p2_out_junction = relay_out_junctions[adjusted_relay_index]
-            elif p2_type == 4:
-                p2_in_junction = borehole_junctions[p2_index][0]
-                p2_out_junction = borehole_junctions[p2_index][1]
+                # Update the pipe sizes to the selected one.
+                for pipe in header_pipes:
+                    net.pipe['diameter_m'][pipe] = available_pipe_sizes[selected_pipe_size]
+                pp.pipeflow(net)
 
-            pipe_pair = []
-            pipe_pair.append(pp.create_pipe_from_parameters(net, p1_in_junction, p2_in_junction,
-                                                                length_km=pipe_length / 1000,
-                                                                diameter_m=initial_diameter))
-            pipe_pair.append(pp.create_pipe_from_parameters(net, p1_out_junction, p2_out_junction,
-                                                            length_km=pipe_length / 1000,
-                                                            diameter_m=initial_diameter))
-            header_pipes.append(pipe_pair)
-        # Constrain system based on flow and pressure requirements.
-        pressure_grid = pp.create_ext_grid(net, ghe_ingress, juntion=ghe_ingress, p_bar=max_ghe_pressure_drop_bar,
-                                           t_k=standard_temperature)
-        total_flowrate = flowrate_per_borehole * len(self.coords)
-        exit_sink = pp.create_sink(net, junction=ghe_egress, mdot_kg_per_s=total_flowrate, name="GHE Egress")
+                # Calculate Flow Imbalance
+                borehole_pipe_flowrates = []
+                for borehole_pipe in borehole_pipes:
+                    borehole_pipe_ind = borehole_pipe
+                    borehole_pipe_flowrates.append(abs(net.res_pipe['mdot_to_kg_per_s'][borehole_pipe_ind]))
+                print("Maximum Flow Imbalance of: ", str(np.max(borehole_pipe_flowrates)
+                                                         - np.min(borehole_pipe_flowrates)))
+                print("Maximum Borehole Flowrate of: ", str(np.max(borehole_pipe_flowrates)))
+                print("Minimum Borehole Flowrate of: ", str(np.min(borehole_pipe_flowrates)))
 
+                circuit_pipe_networks.append(net)
 
-        # The current pipe sizing works as follows:
-        # 1. The pipe sizes for the boreholes is predetermined from the thermal analysis *completed
-        # 2. All of the header pipes are set to the maximum available pipe diameter. *completed
-        # 3. A binary search is performed over the pipe diameters where all the header pipes
-        # are set to the same diameter each step. The goal is to find the minimum diameter possible
-        # for which the total pressure drop across the system is still below the given pressure drop.
-        # 4. Next the pipe diameters are refined by decreasing the pipe pair with the highest flowrate
-        # for each step until the pressure drop prevents any further decreases.
-
-        # First ensure that the constraints can be met with the maximum pipe size.
-        pp.pipeflow(net)
-        if min(net.res_junction['p_bar']) < 0:
-            raise ValueError('Given pressure constraints cannot be met with given borehole pipe'
-                             'size and maximum header pipe size.')
-
-        # 3.
-        selected_pipe_size = 0
-        previous_lower_pipe_size = -1
-        previous_upper_pipe_size = -1
-        lower_pipe_size = 0
-        upper_pipe_size = len(available_pipe_sizes) - 1
-        maximum_iter = 100
-        iter = 0
-        while ((lower_pipe_size != previous_lower_pipe_size) or \
-                (upper_pipe_size != previous_upper_pipe_size)) and iter < maximum_iter:
-            for pipe_pair in header_pipes:
-                net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[selected_pipe_size]
-                net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[selected_pipe_size]
-            pp.pipeflow(net)
-            if min(net.res_junction['p_bar']) < 0:
-                previous_lower_pipe_size = lower_pipe_size
-                lower_pipe_size = selected_pipe_size
-            else:
-                previous_upper_pipe_size = upper_pipe_size
-                upper_pipe_size = selected_pipe_size
-            selected_pipe_size = int(floor(0.5 * (upper_pipe_size + lower_pipe_size)))
-            iter += 1
-        selected_pipe_size = upper_pipe_size
-
-        # Update the pipe sizes to the selected one.
-        for pipe_pair in header_pipes:
-            net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[selected_pipe_size]
-            net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[selected_pipe_size]
-        pp.pipeflow(net)
-
-        # Calculate Flow Imbalance
-        borehole_pipe_flowrates = []
-        for borehole_pipe in borehole_pipes:
-            borehole_pipe_ind = borehole_pipe[0]
-            borehole_pipe_flowrates.append(abs(net.res_pipe['mdot_to_kg_per_s'][borehole_pipe_ind]))
-        print("Maximum Flow Imbalance of: ", str(np.max(borehole_pipe_flowrates)
-                                                 - np.min(borehole_pipe_flowrates)))
-        print("Maximum Borehole Flowrate of: ", str(np.max(borehole_pipe_flowrates)))
-        print("Minimum Borehole Flowrate of: ", str(np.min(borehole_pipe_flowrates)))
 
         '''
         # 4.
@@ -1285,11 +1436,93 @@ class PipeNetwork:
 
 
         # Store pipeflow net
-        self.net = net
+        self.pipe_networks = circuit_pipe_networks
 
 
     def estimate_ghe_cost(self):
-        pass
 
+        trench_lengths = [self.trenches[trench_key]["length"] for trench_key in self.trenches]
+        pipe_size_data = self.pipe_size_data_dict
+        pipe_network_info = self.pipe_networks
+        depth_tiered_cost = [[1000, self.drilling_cost]]
+        trenching_cost = self.trenching_cost
+
+        cost_descriptions, pipe_costs =\
+            NetworkCost(self.coords, trench_lengths, pipe_network_info, pipe_size_data,
+                        design_height=self.design_height, unit_trench_cost=trenching_cost,
+                        depth_tiered_cost=depth_tiered_cost, moving_cost=self.fixed_borehole_cost)
+        self.cost_descriptions = cost_descriptions
+        self.pipe_costs = pipe_costs
+
+def NetworkCost(borehole_coordinates, trench_lengths, pipe_network_info,
+                pipe_size_data
+                , unit_trench_cost=70, design_height=120
+                , depth_tiered_cost=[[50, 100], [150, 120], [300, 140]]
+                , fuse_cost=3.5, moving_cost=.5, pipe_laying_cost=10):
+
+    total_cost = 0
+    cost_descriptions = ["Total Cost"]
+
+    trenching_cost = TrenchCost(trench_lengths, unit_trench_cost)
+    cost_descriptions.append("Trenching Cost")
+    total_cost += trenching_cost
+
+    drilling_cost = DrillCost(borehole_coordinates, design_height, depth_tiered_cost, fuse_cost, moving_cost)
+    cost_descriptions.append("Drilling Cost")
+    total_cost += drilling_cost
+
+    piping_cost = PipeCost(pipe_size_data, pipe_network_info)
+    cost_descriptions.append("Piping Cost")
+    total_cost += piping_cost
+
+    return (cost_descriptions, (total_cost, trenching_cost, drilling_cost, piping_cost))
+
+def TrenchCost(trenching_network, unit_trench_cost):
+    total_trenching = np.sum(trenching_network)
+    return total_trenching * unit_trench_cost
+
+def DrillCost(borehole_coordinates, design_height, depth_tiered_cost, fuse_cost, moving_cost):
+    nbh = len(borehole_coordinates)
+    # drill_cost = nbh * (fuse_cost + moving_cost)
+    drill_cost = 0.0
+    height_left = design_height
+    cost_per_borehole = 0
+    for i in range(len(depth_tiered_cost)):
+        delta_height = None
+        if i == 0:
+            delta_height = depth_tiered_cost[i][0]
+        else:
+            delta_height = depth_tiered_cost[i][0] - depth_tiered_cost[i - 1][0]
+        if delta_height > height_left:
+            cost_per_borehole += height_left * depth_tiered_cost[i][1]
+            break
+        else:
+            cost_per_borehole += delta_height * depth_tiered_cost[i][1]
+            height_left -= delta_height
+    drill_cost += cost_per_borehole * nbh
+    return drill_cost
+
+def PipeCost(pipe_size_data, pipe_network_info):
+    total_piping_cost = 0
+    pipe_material_cost, pipe_length = PipeMaterialCost(pipe_size_data, pipe_network_info)
+    total_piping_cost += pipe_material_cost
+    # total_piping_cost += PipeInstallationCost(pipe_laying_cost, pipe_length)
+    return total_piping_cost
+
+def PipeMaterialCost(pipe_size_data, pipe_network_info):
+    cost = 0
+    total_length = 0
+    pipe_size_dict = dict(pipe_size_data)
+    diameter_to_size = np.vectorize(pipe_size_dict.__getitem__)
+    for pn in pipe_network_info:
+        diameters = pn.pipe.loc[:, 'diameter_m'].to_numpy()
+        lengths = pn.pipe.loc[:, "length_km"].to_numpy() * 1000
+        pipe_costs_per_m = diameter_to_size(diameters)
+        cost += np.sum(lengths * pipe_costs_per_m)
+        total_length += np.sum(lengths)
+    return cost, total_length
+
+def PipeInstallationCost(pipe_laying_cost, pipe_length):
+    return pipe_laying_cost * pipe_length
 
 

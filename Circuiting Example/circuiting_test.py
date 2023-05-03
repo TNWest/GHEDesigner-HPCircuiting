@@ -20,7 +20,7 @@ def main():
     coordinate_file = "Input Files\\Borefield_Coordinates.csv"
     property_boundary_file = "Input Files\\Example_Property.csv"
     nogo_zone_file = "Input Files\\Example_Nogo_Zone.csv"
-    result_file = "PipeNetworkClass_Example.xlsx"
+    result_file = "OUtput Files\\PipeNetworkClass_Example.xlsx"
     cost_data_filename = "Input Files\\Cost_Factors.csv"
     pipe_size_data_filename = "Input Files\\Pipe_Size_Data.csv"
     boreholes_per_circuit = 10

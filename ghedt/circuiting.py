@@ -1344,7 +1344,7 @@ class PipeNetwork:
                                                            diameter_m=initial_diameter))
                 sink = pp.create_sink(net, ghe_egress, flowrate_per_borehole * number_of_boreholes)
                 pressure_grid = pp.create_ext_grid(net, junction=ghe_ingress, p_bar=max_ghe_pressure_drop_bar)
-                pp.plotting.simple_plot(net, plot_sinks=True)
+                # pp.plotting.simple_plot(net, plot_sinks=True)
 
                 # The current pipe sizing works as follows:
                 # 1. The pipe sizes for the boreholes is predetermined from the thermal analysis *completed
@@ -1400,37 +1400,6 @@ class PipeNetwork:
                 print("Minimum Borehole Flowrate of: ", str(np.min(borehole_pipe_flowrates)))
 
                 circuit_pipe_networks.append(net)
-
-
-        '''
-        # 4.
-
-        # Generate list tracking the sizes of each pipe
-        header_pipe_sizes = np.array([selected_pipe_size for pipe_pair in header_pipes])
-        pipes_available_to_change = np.array([True for pipe_pair in header_pipes])
-
-        iter = 0
-        while (pipes_available_to_change.any() == True) and iter < maximum_iter:
-            pipe_flowrates = net.res_pipe['mdot_to_kg_per_s'].abs()
-            pipes_sorted_by_flowrate = np.flip(np.argsort(pipe_flowrates))
-            move_to_next_loop = False
-            for pipe_index in pipes_sorted_by_flowrate:
-                if pipes_available_to_change[pipe_index]:
-                    pipe_pair = header_pipes[pipe_index]
-                    new_pipe_size = header_pipe_sizes[pipe_index] - 1
-                    net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[new_pipe_size]
-                    net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[new_pipe_size]
-                    pp.pipeflow(net)
-                    if min(net.res_junction['p_bar']) < 0:
-                        pipes_available_to_change[pipe_index] = False
-                        net.pipe['diameter_m'][pipe_pair[0]] = available_pipe_sizes[new_pipe_size + 1]
-                        net.pipe['diameter_m'][pipe_pair[1]] = available_pipe_sizes[new_pipe_size + 1]
-                        pp.pipeflow(net)
-                    else:
-                        move_to_next_loop = True
-                if move_to_next_loop:
-                    break
-        '''
 
 
 

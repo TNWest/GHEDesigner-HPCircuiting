@@ -4,6 +4,8 @@ jsonschema>=4.17.3
 numpy>=1.24.2
 pygfunction>=2.2.2
 scipy>=1.10.0
+xlsxwriter>=3.1.0
+pandapipes>=0.8.3
 
 # docs dependencies
 sphinx>=6.1.3

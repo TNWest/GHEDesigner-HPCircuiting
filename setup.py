@@ -1,33 +1,44 @@
-# Jack C. Cook
-# Tuesday, September 28, 2021
+from pathlib import Path
 
-from setuptools import setup, find_packages
+from setuptools import setup
 
-from os import path
-this_directory = path.abspath(path.dirname(__file__))
-with open(path.join(this_directory, 'README.md'), encoding='utf-8') as f:
-    long_description = f.read()
+from ghedesigner import VERSION
 
-setup(name='ghedt',
-      install_requires=['pygfunction>=2.1',
-                        'matplotlib>=3.3.4',
-                        'numpy>=1.19.2',
-                        'Pillow>=8.1.0',
-                        'scipy>=1.6.2',
-                        'pandas>=1.3.2',
-                        'natsort>=7.1.1',
-                        'openpyxl>=3.0.8',
-                        'coolprop>=6.4.1',
-                        'opencv-python==4.5.4.58'],
-      url='https://github.com/j-c-cook/ghedt',
-      download_url='https://github.com/j-c-cook/ghedt/archive/v0.2.tar.gz',
-      long_description=long_description,
-      long_description_content_type='text/markdown',
-      version='0.2',
-      packages=find_packages(),
-      include_package_data=True,
-      author='Jack C. Cook',
-      author_email='jack.cook@okstate.edu',
-      description='A ground heat exchanger design tool with the advanced and '
-                  'unmatched capability of automatic borehole field selection '
-                  'based on drilling geometric land constraints.')
+readme_file = Path(__file__).parent.resolve() / 'README.md'
+readme_contents = readme_file.read_text(encoding='utf8')
+
+short_description = """A ground heat exchanger design tool with the capability
+to select and size flexibly configured borehole fields that are customized
+for specific building and property constraints."""
+
+setup(
+    name='GHEDesigner',
+    install_requires=[
+        'click>=8.1.3',
+        'jsonschema>=4.17.3',
+        'numpy>=1.24.2',
+        'pygfunction>=2.2.2',
+        'scipy>=1.10.0'
+    ],
+    url='https://github.com/BETSRG/GHEDesigner',
+    description=short_description,
+    license='BSD-3',
+    long_description=readme_contents,
+    long_description_content_type='text/markdown',
+    version=VERSION,
+    packages=['ghedesigner'],
+    include_package_data=True,
+    package_data={'ghedesigner': ['schemas/*.json']},
+    author='Jeffrey D. Spitler',
+    author_email='spitler@okstate.edu',
+    entry_points={
+        'console_scripts': ['ghedesigner=ghedesigner.manager:run_manager_from_cli']
+    },
+    python_requires='>=3.8',
+    classifiers=[
+        'Topic :: Scientific/Engineering',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10'
+    ]
+)
